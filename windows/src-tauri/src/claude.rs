@@ -21,11 +21,14 @@ const MAX_TOKENS: u32 = 4096;
 const MAX_INLINE_TEXT: u64 = 200_000;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
+pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-flash";
 
 const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
 You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
 Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
 No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
+
+const GOOGLE_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 #[derive(Default)]
 pub struct Chat {
@@ -68,9 +71,22 @@ pub struct ChatReply {
     pub text: String,
 }
 
-/// One chat turn. Returns the assistant's text, or a message the island shows
-/// in the note view.
+/// One chat turn. Dispatches to Anthropic or Google Gemini based on provider.
 pub async fn send(
+    chat: &Chat,
+    provider: &str,
+    model: &str,
+    query: String,
+    context: Option<ChatContext>,
+) -> Result<ChatReply, String> {
+    if provider == "google" {
+        send_google(chat, model, query, context).await
+    } else {
+        send_anthropic(chat, model, query, context).await
+    }
+}
+
+async fn send_anthropic(
     chat: &Chat,
     model: &str,
     query: String,
@@ -155,6 +171,141 @@ pub async fn send(
         return Err("No response text.".into());
     }
     Ok(ChatReply { text })
+}
+
+async fn send_google(
+    chat: &Chat,
+    model: &str,
+    query: String,
+    context: Option<ChatContext>,
+) -> Result<ChatReply, String> {
+    let key = secrets::get("google-api-key")
+        .ok_or_else(|| "Google AI API key missing. Open settings.".to_string())?;
+
+    let mut user_text = query.clone();
+    if chat.is_empty() {
+        if let Some(ctx) = &context {
+            match ctx {
+                ChatContext::File { name, path } => {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        if let Ok(text) = std::str::from_utf8(&bytes) {
+                            let truncated = if text.len() > 24_000 {
+                                format!("{}\n[truncated]", &text[..24_000])
+                            } else {
+                                text.to_string()
+                            };
+                            user_text = format!("File: {name}\n\n{truncated}\n\n{query}");
+                        } else {
+                            user_text = format!("File: {name}\n\n{query}");
+                        }
+                    } else {
+                        user_text = format!("File: {name}\n\n{query}");
+                    }
+                }
+                ChatContext::Window { app_name, title, url } => {
+                    let mut prefix = format!("Context — App: {app_name}, Window: {title}");
+                    if let Some(u) = url {
+                        prefix.push_str(&format!(", URL: {u}"));
+                    }
+                    user_text = format!("{prefix}\n\n{query}");
+                }
+            }
+        }
+    }
+
+    chat.push(json!({ "role": "user", "content": user_text }));
+
+    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
+    for m in chat.snapshot() {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = if let Some(s) = m.get("content").and_then(Value::as_str) {
+            s.to_string()
+        } else if let Some(arr) = m.get("content").and_then(Value::as_array) {
+            arr.iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        messages.push(json!({ "role": role, "content": content }));
+    }
+
+    let body = json!({
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "messages": messages,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = match client
+        .post(GOOGLE_ENDPOINT)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            chat.pop();
+            return Err(format!("Network error: {e}"));
+        }
+    };
+
+    let status = response.status();
+    let text = match response.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            chat.pop();
+            return Err(e.to_string());
+        }
+    };
+
+    if !status.is_success() {
+        chat.pop();
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        return Err(format!("Google AI API {status}: {detail}"));
+    }
+
+    let parsed: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            chat.pop();
+            return Err(format!("Bad API response: {e}"));
+        }
+    };
+
+    let reply_text = parsed
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+
+    if reply_text.is_empty() {
+        chat.pop();
+        return Err("No response text from Google AI.".into());
+    }
+
+    chat.push(json!({ "role": "assistant", "content": reply_text }));
+    Ok(ChatReply { text: reply_text.to_string() })
 }
 
 async fn call(key: &str, body: &Value) -> Result<Value, String> {

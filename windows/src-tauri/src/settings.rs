@@ -20,10 +20,24 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Chat provider: "anthropic" or "google".
+    #[serde(default = "default_chat_provider")]
+    pub chat_provider: String,
+    /// Google Gemini model used by the chat.
+    #[serde(default = "default_google_model")]
+    pub google_model: String,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_chat_provider() -> String {
+    "google".to_string()
+}
+
+pub fn default_google_model() -> String {
+    crate::claude::DEFAULT_GOOGLE_MODEL.to_string()
 }
 
 impl Default for Settings {
@@ -43,6 +57,8 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            chat_provider: default_chat_provider(),
+            google_model: default_google_model(),
         }
     }
 }

@@ -92,6 +92,10 @@ export interface Settings {
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** Chat provider: "anthropic" | "google". */
+  chatProvider: "anthropic" | "google";
+  /** Google Gemini model used by the chat. */
+  googleModel: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -106,6 +110,8 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  chatProvider: "google",
+  googleModel: "gemini-2.5-flash",
 };
 
 type Listener = () => void;
